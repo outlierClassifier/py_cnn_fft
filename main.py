@@ -1,36 +1,40 @@
-import re
-from fastapi import FastAPI, HTTPException, Request
-import tensorflow as tf
-from tensorflow.keras import Model, Input
-from tensorflow.keras.models import Sequential, Model
-from tensorflow.keras.layers import (
-    Dense, LSTM, Dropout, Masking, GlobalMaxPooling1D, Flatten, 
-    BatchNormalization, Input, Conv1D, Activation, concatenate,
-    MaxPooling1D, SpatialDropout1D, Attention, Bidirectional
-    )
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.regularizers import l2
-from sklearn.model_selection import train_test_split, GroupKFold, GroupShuffleSplit
-from sklearn.utils import class_weight
-from sklearn.metrics import classification_report, confusion_matrix
-import matplotlib.pyplot as plt
-import uvicorn
+from tracemalloc import start
+from turtle import mode
 import numpy as np
+import time, datetime, random
+from typing import List
+import re
+
+from fastapi import HTTPException, APIRouter, Request, FastAPI
+from scipy.fft import rfft
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import classification_report
+
+from tensorflow.keras.layers import (Input, Conv2D, BatchNormalization, ReLU,
+                                     GlobalAveragePooling2D, Dense, Dropout)
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.optimizers import Adam
+import uvicorn
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import time
 import datetime
 import os
 import pickle
 import psutil
 import logging
-from signals import Signal as InternalSignal, Discharge as InternalDischarge, DisruptionClass, get_X_y, get_signal_type, generate_more_discharges, pad
+from signals import Signal as InternalSignal, Discharge as InternalDischarge, DisruptionClass, get_X_y, get_signal_type
 
 PATTERN = "DES_(\\d+)_(\\d+)"
-WINDOW_SIZE = 500
-OVERLAP = 0.2
+WINDOW_SIZE = 64
+FREQ_BINS   = WINDOW_SIZE // 2 + 1
+OVERLAP     = 0.5
+SAMPLE_PER_DISCHARGE = 120
+MODEL_PATH  = "cnn_fft_model.keras" 
+start_time = time.time()
+last_training_time = None
+model = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -100,21 +104,16 @@ class ErrorResponse(BaseModel):
 
 # Initialize FastAPI application
 app = FastAPI(
-    title="LSTM Anomaly Detection API",
-    description="API for anomaly detection using LSTM models",
+    title="CNN Anomaly Detection API",
+    description="API for anomaly detection using CNN models",
     version="1.0.0"
 )
 
-# Global variables
-MODEL_PATH = "lstm_model.keras"
-start_time = time.time()
-last_training_time = None
-model = None
 
 # Load model if exists
 if os.path.exists(MODEL_PATH):
     try:
-        model = pickle.load(open(MODEL_PATH, "rb"))
+        model = load_model(MODEL_PATH)
         logger.info("Existing model loaded successfully")
 
     except Exception as e:
@@ -128,25 +127,42 @@ def get_sensor_id(signal: Signal) -> str:
     else:
         raise ValueError(f"Invalid signal file name format: {signal.fileName}")
 
-def focal_loss(gamma=2.0, alpha=0.25):
-    def f1(y_true, y_pred):
-        bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
-        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
-        alpha_t = y_true * alpha + (1 - y_true) * (1 - alpha)
-        return alpha_t * tf.pow((1 - p_t), gamma) * bce
-    return f1
+def window_fft(signal: np.ndarray) -> np.ndarray:
+    """
+    Returns the FFT of the signal, normalized and reshaped
+    """
+    spec = np.abs(rfft(signal, axis=0))  # (FREQ_BINS, sensores)
+    eps = 1e-9
+    spec = np.log(spec + eps)
+    # normalizar por ventana
+    spec = (spec - spec.mean()) / (spec.std() + eps)
+    return spec[..., np.newaxis]
+
+def build_fft_cnn_model(n_sensors: int) -> Model:
+    inp = Input(shape=(FREQ_BINS, n_sensors, 1))
+    x = Conv2D(32, (3, 3), padding="same")(inp)
+    x = BatchNormalization()(x); x = ReLU()(x)
+    x = Conv2D(64, (3, 3), padding="same")(x)
+    x = BatchNormalization()(x); x = ReLU()(x)
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(32, activation="relu")(x)
+    x = Dropout(0.3)(x)
+    out = Dense(1, activation="sigmoid")(x)
+    model = Model(inp, out)
+    model.compile(optimizer=Adam(1e-3), loss="binary_crossentropy", metrics=["accuracy"])
+    return model
 
 def is_anomaly(discharge: Discharge) -> bool:
     """Determine if a discharge has an anomaly based on anomalyTime"""
     return discharge.anomalyTime is not None
 
-@app.post("/train", response_model=TrainingResponse)
+@app.post('/train', response_model=TrainingResponse)
 async def train_model(request: TrainingRequest):
-    global MODEL_PATH
     start_time = time.time()
+    global model, last_training_time
 
-    # 1) Parse discharges into InternalDischarge
-    internal = []
+    # 1) Parse internal discharges
+    internal: List[InternalDischarge] = []
     for d in request.discharges:
         signals = [InternalSignal(
             label=s.fileName,
@@ -155,191 +171,104 @@ async def train_model(request: TrainingRequest):
             signal_type=get_signal_type(get_sensor_id(s)),
             disruption_class=(DisruptionClass.Anomaly if d.anomalyTime else DisruptionClass.Normal)
         ) for s in d.signals]
-        internal.append(InternalDischarge(
-            signals=signals,
-            disruption_class=(DisruptionClass.Anomaly if d.anomalyTime else DisruptionClass.Normal)
-        ))
+        internal.append(InternalDischarge(signals=signals,
+                          disruption_class=(DisruptionClass.Anomaly if d.anomalyTime else DisruptionClass.Normal)))
 
-    # 2) Optional minimal augmentation
+    # 2) Optional augment: mínimo
     if len(internal) < 10:
-        augmented = []
+        aug = []
         for disc in internal:
-            augmented.extend(disc.generate_similar_discharges(1))
-        internal += augmented
+            aug.extend(disc.generate_similar_discharges(1))
+        internal += aug
 
-    # 3) Windowing + strategic sampling
-    WINDOW_SIZE = 500
-    OVERLAP = 0.3
-    SAMPLE_PER_DISCHARGE = 80  # incrementar ventanas totales
-    windowed, groups = [], []
-
+    # 3) Manual sliding windows + FFT
+    X, y, groups = [], [], []
+    stride = int(WINDOW_SIZE * (1 - OVERLAP))
     for disc_id, disc in enumerate(internal):
-        wins = disc.generate_windows(window_size=WINDOW_SIZE, step=1, overlap=OVERLAP)
-        total_wins = len(wins)
+        # Montar matriz sensores x tiempo
+        data = np.stack([s.values for s in disc.signals])  # shape (n_sensors, T)
+        T = data.shape[1]
+        # Generar ventanas
+        idxs = list(range(0, T - WINDOW_SIZE + 1, stride))
+        if len(idxs) > SAMPLE_PER_DISCHARGE:
+            idxs = np.linspace(0, len(idxs)-1, SAMPLE_PER_DISCHARGE, dtype=int).tolist()
+            idxs = [idxs[i] * stride for i in range(len(idxs))]
+        for start in idxs:
+            window = data[:, start:start+WINDOW_SIZE].T  # (WINDOW_SIZE, n_sensors)
+            fft_spec = window_fft(window)
+            X.append(fft_spec)
+            y.append(1 if disc.disruption_class == DisruptionClass.Anomaly else 0)
+            groups.append(disc_id)
 
-        # Si es anomalía, centramos alrededor del punto de disrupción
-        if disc.disruption_class == DisruptionClass.Anomaly and total_wins > SAMPLE_PER_DISCHARGE:
-            # Tomar mitad de ventanas alrededor de la anomalía
-            center = total_wins // 2
-            half = SAMPLE_PER_DISCHARGE // 2
-            start = max(0, center - half)
-            end = min(total_wins, center + half)
-            idxs = np.arange(start, end)
-            # Si no hay suficientes en el rango, rellenar uniformemente
-            if len(idxs) < SAMPLE_PER_DISCHARGE:
-                extra = np.setdiff1d(np.arange(total_wins), idxs)
-                pick = np.random.choice(extra, SAMPLE_PER_DISCHARGE - len(idxs), replace=False)
-                idxs = np.concatenate([idxs, pick])
-        elif total_wins > SAMPLE_PER_DISCHARGE:
-            # No-disruptiva o pocas ventanas: muestreo uniforme
-            idxs = np.linspace(0, total_wins - 1, SAMPLE_PER_DISCHARGE, dtype=int)
-        else:
-            idxs = np.arange(total_wins)
-
-        sampled_wins = [wins[i] for i in idxs]
-        windowed.extend(sampled_wins)
-        groups.extend([disc_id] * len(sampled_wins))
-
-    # 4) Build input arrays
-    X_list, y_list = get_X_y(windowed)
-    X = np.stack([np.array(sig).T for sig in X_list])  # shape (n_windows, time, sensors)
-    y = np.array(y_list)
+    X = np.stack(X)
+    y = np.array(y)
     groups = np.array(groups)
 
-    # 5) Model factory
-    def build_model():
-        inp = Input(shape=(WINDOW_SIZE, X.shape[-1]))
-        x = Masking(mask_value=0.0)(inp)
-        x = Bidirectional(LSTM(32, return_sequences=False))(x)
-        x = Dropout(0.2)(x)
-        x = Dense(16, activation="relu")(x)
-        x = Dropout(0.2)(x)
-        out = Dense(1, activation="sigmoid")(x)
-        m = Model(inp, out)
-        m.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
-        return m
+    # 4) CV con balance de descargas
+    splitter = GroupShuffleSplit(n_splits=6, test_size=0.25, random_state=42)
+    for fold, (tr, val) in enumerate(splitter.split(X, y, groups), start=1):
+        print(f'--- Fold {fold} ---')
+        X_tr, y_tr = X[tr], y[tr]
+        X_val, y_val = X[val], y[val]
 
-    # 6) Leave-One-Discharge-Out CV
-    cv = GroupShuffleSplit(n_splits=8, test_size=0.25, random_state=42)
-    for fold, (tr_idx, val_idx) in enumerate(cv.split(X, y, groups), start=1):
-        print(f"--- Fold {fold}/8 ---")
-        X_tr, y_tr = X[tr_idx], y[tr_idx]
-        X_val, y_val = X[val_idx], y[val_idx]
+        model = build_fft_cnn_model(n_sensors=X.shape[2])
+        callbacks = [EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True),
+                     ReduceLROnPlateau(monitor='val_loss', patience=2, factor=0.5)]
+        model.fit(X_tr, y_tr, validation_data=(X_val,y_val), epochs=40, batch_size=16,
+                  class_weight={0:1.0,1:1.0}, callbacks=callbacks, verbose=2)
 
-        model = build_model()
-        callbacks = [
-            EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
-        ]
+        preds = (model.predict(X_val)[:,0] > 0.5).astype(int)
+        print(classification_report(y_val, preds, target_names=['Normal','Anomaly'], zero_division=0))
 
-        model.fit(
-            X_tr, y_tr,
-            validation_data=(X_val, y_val),
-            epochs=50,
-            batch_size=8,
-            callbacks=callbacks,
-            shuffle=True
-        )
-
-        probs = model.predict(X_val).ravel()
-        threshold = 0.5
-        preds = (probs > threshold).astype(int)
-        report = classification_report(y_val, preds, labels=[0,1], target_names=["Normal","Anomaly"], zero_division=0)
-        print(f"Fold {fold} report:\n{report}")
-
-    # 7) Save final model
+    # Guardar modelo
     model.save(MODEL_PATH)
+    last_training_time = datetime.datetime.now().isoformat()
+    
+    elapsed = int((time.time() - start_time)*1000)
+    return TrainingResponse(status='success', message='FFT-CNN trained',
+                             trainingId=f'train_{datetime.datetime.now():%Y%m%d_%H%M%S}',
+                             metrics=TrainingMetrics(accuracy=None,loss=None,f1Score=None),
+                             executionTimeMs=elapsed)
+
+@app.post('/predict', response_model=PredictionResponse)
+async def predict(request: PredictionRequest):
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not available")
+    
+    start_time = time.time()
+    mean_probs = []
+    stride = int(WINDOW_SIZE * (1 - OVERLAP))
+    for disc in request.discharges:
+        data = np.stack([s.values for s in disc.signals])  # (n_sensors, T)
+        windows = []
+        for start in range(0, data.shape[1] - WINDOW_SIZE + 1, stride):
+            win = data[:, start:start+WINDOW_SIZE].T
+            windows.append(window_fft(win))
+        if not windows:
+            continue
+        X_batch = np.stack(windows)
+        probs = model.predict(X_batch)[:, 0]
+        mean_probs.append(probs.mean())
+
+    if not mean_probs:
+        print("No valid windows generated for prediction")
+        raise HTTPException(status_code=400, detail='No valid windows generated for prediction')
+
+    overall_confidence = float(np.mean(mean_probs))
+    prediction = int(overall_confidence > 0.5)
     exec_ms = int((time.time() - start_time) * 1000)
-    training_id = f"train_{datetime.datetime.now():%Y%m%d_%H%M%S}"
-    return TrainingResponse(
-        status="success",
-        message="Training completed with anomaly-centered sampling",
-        trainingId=training_id,
-        metrics=TrainingMetrics(accuracy=None, loss=None, f1Score=None),
-        executionTimeMs=exec_ms
+    mean_probs = np.array(mean_probs)
+
+    return PredictionResponse(
+        prediction=prediction,
+        confidence=overall_confidence,
+        executionTimeMs=exec_ms,
+        model="fft_cnn",
+        details={
+            "individualPredictions": mean_probs.tolist()
+        }
     )
 
-
-@app.post("/predict", response_model=PredictionResponse)
-async def predict(request: PredictionRequest):
-    global model
-    
-    start_execution = time.time()
-    print(f"Received prediction request with {len(request.discharges)} discharges")
-    if model is None:
-        raise HTTPException(
-            status_code=400,
-            detail=ErrorResponse(
-                error="Model not trained",
-                code="MODEL_NOT_FOUND",
-                details={"message": "Please train the model first"}
-            ).model_dump()
-        )
-    
-    try:
-        discharges = []
-        for discharge in request.discharges:
-            signals = []
-            for signal in discharge.signals:
-                signals.append(
-                    InternalSignal(
-                        label=signal.fileName,
-                        times=signal.times if signal.times else discharge.times,
-                        values=signal.values,
-                        signal_type=get_signal_type(get_sensor_id(signal)),
-                    ))
-        
-            discharges.append(
-                InternalDischarge(
-                    signals=signals, 
-                )
-            )
-
-        # Generate windowed data
-        windowed_discharges = []
-        for discharge in discharges:
-            windowed_discharges.extend(
-                discharge.generate_windows(
-                    window_size=WINDOW_SIZE, step=1, overlap=OVERLAP
-                )
-            )
-        discharges = windowed_discharges
-
-        X_pred, _ = get_X_y(discharges)
-        X_pred = np.array([np.array(signal).T for signal in X_pred])
-
-        # Make predictions
-        predictions = model.predict(X_pred, batch_size=2)
-        probs = np.where(predictions > 0.5, 1, 0).flatten()
-        print(f"Predictions: {predictions}")
-
-        confidence = np.mean(predictions)
-        print(f"Confidence: {confidence}")
-        
-        execution_time = (time.time() - start_execution) * 1000  # ms
-        return PredictionResponse(
-            prediction=int(predictions[0]),
-            confidence=float(confidence),
-            executionTimeMs=execution_time,
-            model="lstm",
-            details={
-                "individualPredictions": predictions.tolist(),
-                "individualConfidences": confidence.tolist(),
-                "numDischargesProcessed": len(request.discharges),
-                "featureImportance": 0
-            }
-        )
-        
-    except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=ErrorResponse(
-                error="Prediction failed",
-                code="PREDICTION_ERROR",
-                details={"message": str(e)}
-            ).model_dump()
-        )
 
 @app.get("/health", response_model=HealthCheckResponse)
 async def health_check():
@@ -371,7 +300,7 @@ if __name__ == "__main__":
     # Try to load the model
     if os.path.exists(MODEL_PATH):
         try:
-            model = pickle.load(open(MODEL_PATH, "rb"))
+            model = load_model(MODEL_PATH)
             logger.info("Existing model loaded successfully")
         except Exception as e:
             logger.error(f"Error loading model: {str(e)}")
