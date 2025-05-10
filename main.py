@@ -1,11 +1,9 @@
-from tracemalloc import start
-from turtle import mode
 import numpy as np
-import time, datetime, random
+import time, datetime
 from typing import List
 import re
 
-from fastapi import HTTPException, APIRouter, Request, FastAPI
+from fastapi import HTTPException, Request, FastAPI
 from scipy.fft import rfft
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import classification_report
@@ -13,7 +11,7 @@ from sklearn.metrics import classification_report
 from tensorflow.keras.layers import (Input, Conv2D, BatchNormalization, ReLU,
                                      GlobalAveragePooling2D, Dense, Dropout)
 from tensorflow.keras.models import Model, load_model
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 import uvicorn
 from typing import List, Dict, Any, Optional
@@ -21,10 +19,9 @@ from pydantic import BaseModel
 import time
 import datetime
 import os
-import pickle
 import psutil
 import logging
-from signals import Signal as InternalSignal, Discharge as InternalDischarge, DisruptionClass, get_X_y, get_signal_type
+from signals import Signal as InternalSignal, Discharge as InternalDischarge, DisruptionClass, get_signal_type, normalize, are_normalized
 
 PATTERN = "DES_(\\d+)_(\\d+)"
 WINDOW_SIZE = 64
@@ -109,6 +106,30 @@ app = FastAPI(
     version="1.0.0"
 )
 
+def to_internal_discharges(discharges_pyd: List[Discharge]) -> List[InternalDischarge]:
+    """Convert Pydantic discharges → InternalDischarge (sean Normal o Anomaly)."""
+    internal = []
+    for d in discharges_pyd:
+        signals_int = []
+        for s in d.signals:
+            # Inferimos el id del sensor del nombre de fichero:  DES_#####_<id>_*
+            match = re.search(r'_(\d+)_', s.fileName)
+            sig_id  = int(match.group(1)) if match else None
+            sig_type = get_signal_type(sig_id) if sig_id else None
+            signals_int.append(
+                InternalSignal(
+                    label=s.fileName,
+                    times=s.times or d.times,
+                    values=s.values,
+                    signal_type=sig_type,
+                    disruption_class=DisruptionClass.Unknown
+                )
+            )
+        internal.append(
+            InternalDischarge(signals=signals_int, disruption_class=DisruptionClass.Unknown)
+        )
+    return internal
+
 
 # Load model if exists
 if os.path.exists(MODEL_PATH):
@@ -131,19 +152,19 @@ def window_fft(signal: np.ndarray) -> np.ndarray:
     """
     Returns the FFT of the signal, normalized and reshaped
     """
-    spec = np.abs(rfft(signal, axis=0))  # (FREQ_BINS, sensores)
     eps = 1e-9
+    spec = np.abs(rfft(signal, axis=0))  # (FREQ_BINS, sensores)
     spec = np.log(spec + eps)
-    # normalizar por ventana
-    spec = (spec - spec.mean()) / (spec.std() + eps)
     return spec[..., np.newaxis]
 
 def build_fft_cnn_model(n_sensors: int) -> Model:
     inp = Input(shape=(FREQ_BINS, n_sensors, 1))
     x = Conv2D(32, (3, 3), padding="same")(inp)
-    x = BatchNormalization()(x); x = ReLU()(x)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
     x = Conv2D(64, (3, 3), padding="same")(x)
-    x = BatchNormalization()(x); x = ReLU()(x)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
     x = GlobalAveragePooling2D()(x)
     x = Dense(32, activation="relu")(x)
     x = Dropout(0.3)(x)
@@ -173,8 +194,12 @@ async def train_model(request: TrainingRequest):
         ) for s in d.signals]
         internal.append(InternalDischarge(signals=signals,
                           disruption_class=(DisruptionClass.Anomaly if d.anomalyTime else DisruptionClass.Normal)))
+    
+    # Normalize signals
+    if not are_normalized(internal):
+        internal = normalize(internal)
 
-    # 2) Optional augment: mínimo
+    # 2) Optional augment
     if len(internal) < 10:
         aug = []
         for disc in internal:
@@ -236,19 +261,29 @@ async def predict(request: PredictionRequest):
         raise HTTPException(status_code=503, detail="Model not available")
     
     start_time = time.time()
-    mean_probs = []
-    stride = int(WINDOW_SIZE * (1 - OVERLAP))
     for disc in request.discharges:
         data = np.stack([s.values for s in disc.signals])  # (n_sensors, T)
+    
+    discharges_int = to_internal_discharges(request.discharges)
+    if not are_normalized(discharges_int):
+        discharges_int = normalize(discharges_int)
+    
+    
+    mean_probs = []
+    stride = int(WINDOW_SIZE * (1 - OVERLAP))
+    for disc in discharges_int:
+        data = np.stack([s.values for s in disc.signals])  # shape (n_sensors, T)
         windows = []
         for start in range(0, data.shape[1] - WINDOW_SIZE + 1, stride):
             win = data[:, start:start+WINDOW_SIZE].T
             windows.append(window_fft(win))
+
         if not windows:
             continue
         X_batch = np.stack(windows)
         probs = model.predict(X_batch)[:, 0]
         mean_probs.append(probs.mean())
+    
 
     if not mean_probs:
         print("No valid windows generated for prediction")
