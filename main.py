@@ -1,4 +1,5 @@
 import json
+import random
 import numpy as np
 import time, datetime
 from typing import List
@@ -11,8 +12,9 @@ from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import classification_report
 from sklearn.utils.class_weight import compute_class_weight
 
+import tensorflow as tf
 from tensorflow.keras.layers import (Input, Conv2D, BatchNormalization, ReLU,
-                                     GlobalAveragePooling2D, Dense, Dropout)
+                                     GlobalAveragePooling2D, Dense, Dropout, Concatenate)
 from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
@@ -28,6 +30,11 @@ from signals import (Signal as InternalSignal, Discharge as InternalDischarge,
                      DisruptionClass, SignalType, get_signal_type, normalize, are_normalized, mean_sensor_psd)
 from zscore_normalizer import apply_zscore, compute_zscore_stats
 
+SEED = 50
+os.environ['PYTHONHASHSEED'] = str(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
 PATTERN = "DES_(\\d+)_(\\d+)"
 WINDOW_SIZE = 256
 FREQ_BINS   = WINDOW_SIZE // 2 + 1
@@ -160,18 +167,26 @@ def window_fft(signal: np.ndarray) -> np.ndarray:
     return spec[..., np.newaxis]
 
 def build_fft_cnn_model(n_sensors: int) -> Model:
-    inp = Input(shape=(FREQ_BINS, n_sensors, 1))
-    x = Conv2D(32, (3, 3), padding="same")(inp)
+    # Spectral branch
+    inp_spec = Input(shape=(FREQ_BINS, n_sensors, 1), name="spectral_input")
+    x = Conv2D(32, (3, 3), padding="same")(inp_spec)
     x = BatchNormalization()(x)
     x = ReLU()(x)
     x = Conv2D(64, (3, 3), padding="same")(x)
     x = BatchNormalization()(x)
     x = ReLU()(x)
     x = GlobalAveragePooling2D()(x)
-    x = Dense(32, activation="relu")(x)
-    x = Dropout(0.3)(x)
-    out = Dense(1, activation="sigmoid")(x)
-    model = Model(inp, out)
+
+    # Energy branch
+    inp_e = Input(shape=(1,), name="energy_input")
+    e = Dense(32, activation="relu")(inp_e)
+    e = Dense(16, activation="relu", name="dense_energy")(e)
+
+    cat = Concatenate()([x, e])
+    cat = Dense(32, activation="relu")(cat)
+    cat = Dropout(0.3)(cat)
+    out = Dense(1, activation="sigmoid")(cat)
+    model = Model(inputs=[inp_spec, inp_e], outputs=out)
     model.compile(optimizer=Adam(1e-3), loss="binary_crossentropy", metrics=["accuracy"])
     return model
 
@@ -224,7 +239,7 @@ async def train_model(request: TrainingRequest):
         internal += aug
 
     # 3) Manual sliding windows + FFT
-    X, y, groups = [], [], []
+    X, E, y, groups = [], [], [], []
     stride = int(WINDOW_SIZE * (1 - OVERLAP))
     for disc_id, disc in enumerate(internal):
         # Montar matriz sensores x tiempo
@@ -238,7 +253,9 @@ async def train_model(request: TrainingRequest):
         for start in idxs:
             window = data[:, start:start+WINDOW_SIZE].T  # (WINDOW_SIZE, n_sensors)
             fft_spec = window_fft(window)
+            E_win = np.mean(window ** 2).astype(np.float32)
             X.append(fft_spec)
+            E.append(E_win)
             y.append(1 if disc.disruption_class == DisruptionClass.Anomaly else 0)
             groups.append(disc_id)
 
@@ -248,20 +265,24 @@ async def train_model(request: TrainingRequest):
     groups_disc = np.arange(len(internal))
 
     X = np.stack(X)
+    E = np.asarray(E).reshape(-1, 1)
     y = np.array(y)
     groups = np.array(groups)
 
-    max_trials = 50
+    max_trials = 250
     n_splits = min(4, np.bincount(y_disc).min())
     balanced_splits = None
 
     for trial in range(max_trials):
-        splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True)
+        splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=SEED + trial)
         candidate = [] # store tr, val for this trial
 
         for (tr, val) in splitter.split(groups_disc, y_disc, groups_disc):
             cnt = Counter(y_disc[val])
             ratio = min(cnt.values()) / max(cnt.values())
+
+            if len(cnt) == 1:
+                break
 
             if ratio < 0.25:
                 break
@@ -281,8 +302,8 @@ async def train_model(request: TrainingRequest):
         tr_mask = np.isin(groups, tr)
         val_mask = ~tr_mask
 
-        X_tr, y_tr = X[tr_mask], y[tr_mask]
-        X_val, y_val = X[val_mask], y[val_mask]
+        X_tr, E_tr, y_tr = X[tr_mask], E[tr_mask], y[tr_mask]
+        X_val, E_val, y_val = X[val_mask], E[val_mask], y[val_mask]
 
         cnt = Counter(y_val)
         print(f'--- Fold: {fold} support: {cnt} ---')
@@ -292,15 +313,19 @@ async def train_model(request: TrainingRequest):
                      ReduceLROnPlateau(monitor='val_loss', patience=2, factor=0.5)]
         class_weights = compute_class_weight('balanced', classes=np.unique(y_tr), y=y_tr)
         class_weights = {i: w for i, w in enumerate(class_weights)}
-        model.fit(X_tr, y_tr, 
-                  validation_data=(X_val,y_val), 
+        model.fit([X_tr, E_tr], y_tr, 
+                  validation_data=([X_val, E_val], y_val), 
                   epochs=40, 
                   batch_size=16,
                   class_weight=class_weights, 
                   callbacks=callbacks, 
                   verbose=2)
 
-        preds = (model.predict(X_val)[:,0] > 0.5).astype(int)
+        w_E, b_E = model.get_layer('dense_energy').get_weights()
+        print(f"||W_E||: {np.linalg.norm(w_E)}")
+        print(f"||b_E||: {np.linalg.norm(b_E)}")
+
+        preds = (model.predict([X_val, E_val])[:,0] > 0.5).astype(int)
         print(classification_report(y_val, 
                                     preds,
                                     labels=[0, 1],
@@ -327,23 +352,28 @@ async def predict(request: PredictionRequest):
         data = np.stack([s.values for s in disc.signals])  # (n_sensors, T)
     
     discharges_int = to_internal_discharges(request.discharges)
+    with open('zscore_stats.json', 'r') as f:
+        stats = {SignalType[k]: v for k, v in json.load(f).items()}
+
     if not are_normalized(discharges_int):
-        discharges_int = normalize(discharges_int)
+        discharges_int = apply_zscore(discharges_int, stats)
     
     
     mean_probs = []
     stride = int(WINDOW_SIZE * (1 - OVERLAP))
     for disc in discharges_int:
         data = np.stack([s.values for s in disc.signals])  # shape (n_sensors, T)
-        windows = []
+        windows, energies = [], []
         for start in range(0, data.shape[1] - WINDOW_SIZE + 1, stride):
             win = data[:, start:start+WINDOW_SIZE].T
             windows.append(window_fft(win))
+            energies.append(np.mean(win ** 2).astype(np.float32))
 
         if not windows:
             continue
         X_batch = np.stack(windows)
-        probs = model.predict(X_batch)[:, 0]
+        E_batch = np.asarray(energies).reshape(-1, 1)
+        probs = model.predict([X_batch, E_batch])[:, 0]
         mean_probs.append(probs.mean())
     
 
