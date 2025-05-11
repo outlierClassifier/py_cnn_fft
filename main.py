@@ -116,10 +116,7 @@ def to_internal_discharges(discharges_pyd: List[Discharge]) -> List[InternalDisc
     for d in discharges_pyd:
         signals_int = []
         for s in d.signals:
-            # Inferimos el id del sensor del nombre de fichero:  DES_#####_<id>_*
-            match = re.search(r'_(\d+)_', s.fileName)
-            sig_id  = int(match.group(1)) if match else None
-            sig_type = get_signal_type(sig_id) if sig_id else None
+            sig_type = get_signal_type(get_sensor_id(s))
             signals_int.append(
                 InternalSignal(
                     label=s.fileName,
