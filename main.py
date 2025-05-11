@@ -3,6 +3,7 @@ import numpy as np
 import time, datetime
 from typing import List
 import re
+from collections import Counter
 
 from fastapi import HTTPException, Request, FastAPI
 from scipy.fft import rfft
@@ -241,16 +242,50 @@ async def train_model(request: TrainingRequest):
             y.append(1 if disc.disruption_class == DisruptionClass.Anomaly else 0)
             groups.append(disc_id)
 
+    # etiquetas a nivel de descarga
+    y_disc = [1 if d.disruption_class == DisruptionClass.Anomaly else 0 for d in internal]
+    y_disc = np.array(y_disc)
+    groups_disc = np.arange(len(internal))
+
     X = np.stack(X)
     y = np.array(y)
     groups = np.array(groups)
 
-    # 4) CV con balance de descargas
-    splitter = StratifiedGroupKFold(n_splits=6, shuffle=True)
-    for fold, (tr, val) in enumerate(splitter.split(X, y, groups), start=1):
-        print(f'--- Fold {fold} ---')
-        X_tr, y_tr = X[tr], y[tr]
-        X_val, y_val = X[val], y[val]
+    max_trials = 50
+    n_splits = min(4, np.bincount(y_disc).min())
+    balanced_splits = None
+
+    for trial in range(max_trials):
+        splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True)
+        candidate = [] # store tr, val for this trial
+
+        for (tr, val) in splitter.split(groups_disc, y_disc, groups_disc):
+            cnt = Counter(y_disc[val])
+            ratio = min(cnt.values()) / max(cnt.values())
+
+            if ratio < 0.25:
+                break
+            candidate.append((tr, val))
+        else:
+            # If we reach here, it means we found a balanced split
+            balanced_splits = candidate
+            break
+    
+    if balanced_splits is None:
+        raise RuntimeError(
+            f"Unable to find a balanced split after {max_trials} trials. "
+            "Consider reducing the number of splits or adjusting the distribution of discharges."
+        )
+
+    for fold, (tr, val) in enumerate(balanced_splits, start=1):
+        tr_mask = np.isin(groups, tr)
+        val_mask = ~tr_mask
+
+        X_tr, y_tr = X[tr_mask], y[tr_mask]
+        X_val, y_val = X[val_mask], y[val_mask]
+
+        cnt = Counter(y_val)
+        print(f'--- Fold: {fold} support: {cnt} ---')
 
         model = build_fft_cnn_model(n_sensors=X.shape[2])
         callbacks = [EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True),
