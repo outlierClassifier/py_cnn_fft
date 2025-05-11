@@ -28,7 +28,7 @@ from signals import (Signal as InternalSignal, Discharge as InternalDischarge,
 from zscore_normalizer import apply_zscore, compute_zscore_stats
 
 PATTERN = "DES_(\\d+)_(\\d+)"
-WINDOW_SIZE = 64
+WINDOW_SIZE = 256
 FREQ_BINS   = WINDOW_SIZE // 2 + 1
 OVERLAP     = 0.5
 SAMPLE_PER_DISCHARGE = 120
@@ -195,10 +195,25 @@ async def train_model(request: TrainingRequest):
         ) for s in d.signals]
         internal.append(InternalDischarge(signals=signals,
                           disruption_class=(DisruptionClass.Anomaly if d.anomalyTime else DisruptionClass.Normal)))
+        
+    stats = compute_zscore_stats(internal)
+
+    # Convert SignalType enum keys to strings for JSON serialization
+    serializable_stats = {}
+    for key, value in stats.items():
+        if isinstance(key, SignalType):
+            serializable_stats[key.name] = value  # Using the name attribute of the enum
+        else:
+            serializable_stats[str(key)] = value
+            
+    # save stats to a json for inference
+    with open('zscore_stats.json', 'w') as f:
+        json.dump(serializable_stats, f)
     
     # Normalize signals
     if not are_normalized(internal):
-        internal = normalize(internal)
+        internal = apply_zscore(internal, stats)
+
 
     # 2) Optional augment
     if len(internal) < 10:
@@ -231,7 +246,7 @@ async def train_model(request: TrainingRequest):
     groups = np.array(groups)
 
     # 4) CV con balance de descargas
-    splitter = GroupShuffleSplit(n_splits=6, test_size=0.25, random_state=42)
+    splitter = StratifiedGroupKFold(n_splits=6, shuffle=True)
     for fold, (tr, val) in enumerate(splitter.split(X, y, groups), start=1):
         print(f'--- Fold {fold} ---')
         X_tr, y_tr = X[tr], y[tr]
@@ -240,11 +255,22 @@ async def train_model(request: TrainingRequest):
         model = build_fft_cnn_model(n_sensors=X.shape[2])
         callbacks = [EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True),
                      ReduceLROnPlateau(monitor='val_loss', patience=2, factor=0.5)]
-        model.fit(X_tr, y_tr, validation_data=(X_val,y_val), epochs=40, batch_size=16,
-                  class_weight={0:1.0,1:1.0}, callbacks=callbacks, verbose=2)
+        class_weights = compute_class_weight('balanced', classes=np.unique(y_tr), y=y_tr)
+        class_weights = {i: w for i, w in enumerate(class_weights)}
+        model.fit(X_tr, y_tr, 
+                  validation_data=(X_val,y_val), 
+                  epochs=40, 
+                  batch_size=16,
+                  class_weight=class_weights, 
+                  callbacks=callbacks, 
+                  verbose=2)
 
         preds = (model.predict(X_val)[:,0] > 0.5).astype(int)
-        print(classification_report(y_val, preds, target_names=['Normal','Anomaly'], zero_division=0))
+        print(classification_report(y_val, 
+                                    preds,
+                                    labels=[0, 1],
+                                    target_names=['Normal','Anomaly'], 
+                                    zero_division=0))
 
     # Guardar modelo
     model.save(MODEL_PATH)
