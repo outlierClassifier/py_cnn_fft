@@ -388,7 +388,7 @@ async def predict(request: PredictionRequest):
 
     return PredictionResponse(
         prediction=prediction,
-        confidence=overall_confidence,
+        confidence=overall_confidence if prediction == 1 else 1 - overall_confidence,
         executionTimeMs=exec_ms,
         model="fft_cnn",
         details={
