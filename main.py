@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import time, datetime
 from typing import List
@@ -5,8 +6,9 @@ import re
 
 from fastapi import HTTPException, Request, FastAPI
 from scipy.fft import rfft
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import classification_report
+from sklearn.utils.class_weight import compute_class_weight
 
 from tensorflow.keras.layers import (Input, Conv2D, BatchNormalization, ReLU,
                                      GlobalAveragePooling2D, Dense, Dropout)
@@ -21,7 +23,9 @@ import datetime
 import os
 import psutil
 import logging
-from signals import Signal as InternalSignal, Discharge as InternalDischarge, DisruptionClass, get_signal_type, normalize, are_normalized
+from signals import (Signal as InternalSignal, Discharge as InternalDischarge, 
+                     DisruptionClass, SignalType, get_signal_type, normalize, are_normalized, mean_sensor_psd)
+from zscore_normalizer import apply_zscore, compute_zscore_stats
 
 PATTERN = "DES_(\\d+)_(\\d+)"
 WINDOW_SIZE = 64
