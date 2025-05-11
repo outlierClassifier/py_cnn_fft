@@ -2,17 +2,20 @@ from enum import Enum
 from typing import Any
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
+from scipy.signal import welch
 import os
 
 class SignalType(Enum):
     """Enum for signal types."""
-    CorrientePlasma = 1,
-    ModeLock = 2,
-    Inductancia = 3,
-    Densidad = 4,
-    DerivadaEnergiaDiamagnetica = 5,
-    PotenciaRadiada = 6,
-    PotenciaDeEntrada = 7,
+    CorrientePlasma = 1
+    ModeLock = 2
+    Inductancia = 3
+    Densidad = 4
+    DerivadaEnergiaDiamagnetica = 5
+    PotenciaRadiada = 6
+    PotenciaDeEntrada = 7
+    signal8 = 8
+    signal9 = 9
 
 def get_signal_type(signal_type: int) -> SignalType:
     """
@@ -20,13 +23,18 @@ def get_signal_type(signal_type: int) -> SignalType:
     :param signal_type: The signal type as an integer.
     :return: The signal type as a SignalType enum.
     """
-    return SignalType(signal_type) if signal_type in [s.value for s in SignalType] else None
+    try:
+        signal_type = int(signal_type)
+    except ValueError:
+        print(f"Error: {signal_type} is not a valid signal type. Must be an integer.")
+        return None
+    return SignalType(signal_type)
 
 class DisruptionClass(Enum):
     """Enum for disruption classes."""
-    Normal = 0,
-    Anomaly = 1,
-    Unknown = 2,
+    Normal = 0
+    Anomaly = 1
+    Unknown = 2
 
 
 class Signal:
@@ -174,6 +182,28 @@ class Discharge:
         :return: The shape of the discharge as a tuple (number of signals, number of values per signal).
         """
         return len(self.signals), len(self.signals[0].values) if self.signals else 0
+
+def mean_sensor_psd(discharges, fs=500, nperseg=1024, signal_type=None | list[SignalType]):
+    psd_accum_normal, psd_accum_disrup = [], []
+    if signal_type is not None and not isinstance(signal_type, list):
+        signal_type = [signal_type]
+    
+    for disc in discharges:
+        if disc.disruption_class == DisruptionClass.Normal:
+            for sig in disc.signals:
+                if signal_type is None or sig.signal_type in signal_type:
+                    f, pxx = welch(sig.values, fs=fs, nperseg=nperseg)
+                    psd_accum_normal.append(np.log10(pxx + 1e-12))   # dB
+                
+        elif disc.disruption_class == DisruptionClass.Anomaly:
+            for sig in disc.signals:
+                if signal_type is None or sig.signal_type in signal_type:
+                    f, pxx = welch(sig.values, fs=fs, nperseg=nperseg)
+                    psd_accum_disrup.append(np.log10(pxx + 1e-12))
+                
+    psd_mean_normal = np.mean(psd_accum_normal, axis=0)
+    psd_mean_disrup = np.mean(psd_accum_disrup, axis=0)
+    return f, psd_mean_normal, psd_mean_disrup
 
 def normalize_vec(list_values: list[Signal]):
     """
