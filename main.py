@@ -26,6 +26,7 @@ import datetime
 import os
 import psutil
 import logging
+import httpx
 from signals import (Signal as InternalSignal, Discharge as InternalDischarge, 
                      DisruptionClass, SignalType, get_signal_type, normalize, are_normalized, mean_sensor_psd)
 from zscore_normalizer import apply_zscore, compute_zscore_stats
@@ -40,10 +41,11 @@ WINDOW_SIZE = 256
 FREQ_BINS   = WINDOW_SIZE // 2 + 1
 OVERLAP     = 0.5
 SAMPLE_PER_DISCHARGE = 120
-MODEL_PATH  = "cnn_fft_model.keras" 
+MODEL_PATH  = "cnn_fft_model.keras"
 start_time = time.time()
 last_training_time = None
 model = None
+training_session = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -64,7 +66,7 @@ class Discharge(BaseModel):
     signals: List[Signal]
 
 class PredictionRequest(BaseModel):
-    discharges: List[Discharge]
+    discharge: Discharge
 
 class PredictionResponse(BaseModel):
     prediction: int
@@ -94,17 +96,21 @@ class TrainingResponse(BaseModel):
     metrics: Optional[TrainingMetrics] = None
     executionTimeMs: float
 
-class MemoryInfo(BaseModel):
-    total: float
-    used: float
-
 class HealthCheckResponse(BaseModel):
-    status: str
-    version: str
+    name: str
     uptime: float
-    memory: MemoryInfo
-    load: float
     lastTraining: Optional[str] = None
+
+class StartTrainingRequest(BaseModel):
+    totalDischarges: int
+    timeoutSeconds: int
+
+class StartTrainingResponse(BaseModel):
+    expectedDischarges: int
+
+class DischargeAck(BaseModel):
+    ordinal: int
+    totalDischarges: int
 
 class ErrorResponse(BaseModel):
     error: str
@@ -194,8 +200,7 @@ def is_anomaly(discharge: Discharge) -> bool:
     """Determine if a discharge has an anomaly based on anomalyTime"""
     return discharge.anomalyTime is not None
 
-@app.post('/train', response_model=TrainingResponse)
-async def train_model(request: TrainingRequest):
+async def run_training(request: TrainingRequest) -> TrainingResponse:
     start_time = time.time()
     global model, last_training_time
 
@@ -342,16 +347,55 @@ async def train_model(request: TrainingRequest):
                              metrics=TrainingMetrics(accuracy=None,loss=None,f1Score=None),
                              executionTimeMs=elapsed)
 
+
+async def send_training_completed(resp: TrainingResponse) -> None:
+    """Notify orchestrator when training finishes."""
+    url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8000") + "/trainingCompleted"
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(url, json=resp.dict())
+    except Exception as e:
+        logger.error(f"trainingCompleted callback failed: {e}")
+
+
+@app.post('/train', response_model=StartTrainingResponse)
+async def start_training(request: StartTrainingRequest):
+    """Initialize a training session."""
+    global training_session
+    if training_session is not None:
+        raise HTTPException(status_code=503, detail="Training already in progress")
+    training_session = {
+        "expected": request.totalDischarges,
+        "discharges": [],
+    }
+    return StartTrainingResponse(expectedDischarges=request.totalDischarges)
+
+
+@app.post('/train/{ordinal}', response_model=DischargeAck)
+async def push_discharge(ordinal: int, discharge: Discharge):
+    global training_session
+    if training_session is None:
+        raise HTTPException(status_code=400, detail="No training session active")
+    if ordinal != len(training_session["discharges"]) + 1:
+        raise HTTPException(status_code=400, detail="Unexpected ordinal")
+    training_session["discharges"].append(discharge)
+    ack = DischargeAck(ordinal=ordinal, totalDischarges=training_session["expected"])
+    if len(training_session["discharges"]) >= training_session["expected"]:
+        req = TrainingRequest(discharges=training_session["discharges"], options=None)
+        resp = await run_training(req)
+        await send_training_completed(resp)
+        training_session = None
+    return ack
+
 @app.post('/predict', response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not available")
-    
+
     start_time = time.time()
-    for disc in request.discharges:
-        data = np.stack([s.values for s in disc.signals])  # (n_sensors, T)
-    
-    discharges_int = to_internal_discharges(request.discharges)
+    data = np.stack([s.values for s in request.discharge.signals])
+
+    discharges_int = to_internal_discharges([request.discharge])
     with open('zscore_stats.json', 'r') as f:
         stats = {SignalType[k]: v for k, v in json.load(f).items()}
 
@@ -387,7 +431,7 @@ async def predict(request: PredictionRequest):
     mean_probs = np.array(mean_probs)
 
     return PredictionResponse(
-        prediction=prediction,
+        prediction="Anomaly" if prediction == 1 else "Normal",
         confidence=overall_confidence if prediction == 1 else 1 - overall_confidence,
         executionTimeMs=exec_ms,
         model="fft_cnn",
@@ -399,19 +443,10 @@ async def predict(request: PredictionRequest):
 
 @app.get("/health", response_model=HealthCheckResponse)
 async def health_check():
-    # Get memory information
-    mem = psutil.virtual_memory()
-    
     return HealthCheckResponse(
-        status="online" if model is not None else "degraded",
-        version="1.0.0",
+        name="fft_cnn",
         uptime=time.time() - start_time,
-        memory=MemoryInfo(
-            total=mem.total / (1024*1024),  # Convert to MB
-            used=mem.used / (1024*1024)
-        ),
-        load=psutil.cpu_percent() / 100,
-        lastTraining=last_training_time
+        lastTraining=last_training_time,
     )
 
 # Custom middleware to handle large request JSON payloads
