@@ -20,7 +20,7 @@ from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 import uvicorn
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 import time
 import datetime
 import os
@@ -40,10 +40,11 @@ WINDOW_SIZE = 256
 FREQ_BINS   = WINDOW_SIZE // 2 + 1
 OVERLAP     = 0.5
 SAMPLE_PER_DISCHARGE = 120
-MODEL_PATH  = "cnn_fft_model.keras" 
+MODEL_PATH  = "cnn_fft_model.keras"
 start_time = time.time()
 last_training_time = None
 model = None
+training_session = None  # holds pending training discharges
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -51,23 +52,29 @@ logger = logging.getLogger(__name__)
 
 # Define Pydantic models for request/response based on API schemas
 class Signal(BaseModel):
-    fileName: str
+    filename: str
     values: List[float]
-    times: Optional[List[float]] = None
-    length: Optional[int] = None
+    # allow legacy field name
+    class Config:
+        fields = {"filename": "fileName"}
 
 class Discharge(BaseModel):
     id: str
-    times: Optional[List[float]] = None
-    length: Optional[int] = None
+    times: List[float]
+    length: int
     anomalyTime: Optional[float] = None
     signals: List[Signal]
 
-class PredictionRequest(BaseModel):
-    discharges: List[Discharge]
+    @validator('signals', pre=True)
+    def _ensure_list(cls, v):
+        if isinstance(v, dict):
+            return [v]
+        return v
+
+
 
 class PredictionResponse(BaseModel):
-    prediction: int
+    prediction: str
     confidence: float
     executionTimeMs: float
     model: str
@@ -94,17 +101,30 @@ class TrainingResponse(BaseModel):
     metrics: Optional[TrainingMetrics] = None
     executionTimeMs: float
 
+class StartTrainingRequest(BaseModel):
+    totalDischarges: int
+    timeoutSeconds: int
+
+class StartTrainingResponse(BaseModel):
+    expectedDischarges: int
+
+class DischargeAck(BaseModel):
+    ordinal: int
+    totalDischarges: int
+
 class MemoryInfo(BaseModel):
     total: float
     used: float
 
 class HealthCheckResponse(BaseModel):
-    status: str
-    version: str
+    name: str
     uptime: float
-    memory: MemoryInfo
-    load: float
     lastTraining: Optional[str] = None
+    # additional optional information
+    status: Optional[str] = None
+    version: Optional[str] = None
+    memory: Optional[MemoryInfo] = None
+    load: Optional[float] = None
 
 class ErrorResponse(BaseModel):
     error: str
@@ -127,8 +147,8 @@ def to_internal_discharges(discharges_pyd: List[Discharge]) -> List[InternalDisc
             sig_type = get_signal_type(get_sensor_id(s))
             signals_int.append(
                 InternalSignal(
-                    label=s.fileName,
-                    times=s.times or d.times,
+                    label=s.filename,
+                    times=d.times,
                     values=s.values,
                     signal_type=sig_type,
                     disruption_class=DisruptionClass.Unknown
@@ -151,11 +171,11 @@ if os.path.exists(MODEL_PATH):
 
 def get_sensor_id(signal: Signal) -> str:
     """Extract sensor ID from signal file name"""
-    match = re.match(PATTERN, signal.fileName)
+    match = re.match(PATTERN, signal.filename)
     if match:
         return match.group(2)
     else:
-        raise ValueError(f"Invalid signal file name format: {signal.fileName}")
+        raise ValueError(f"Invalid signal file name format: {signal.filename}")
 
 def window_fft(signal: np.ndarray) -> np.ndarray:
     """
@@ -194,17 +214,16 @@ def is_anomaly(discharge: Discharge) -> bool:
     """Determine if a discharge has an anomaly based on anomalyTime"""
     return discharge.anomalyTime is not None
 
-@app.post('/train', response_model=TrainingResponse)
-async def train_model(request: TrainingRequest):
+def train_model(discharges: List[Discharge]) -> TrainingResponse:
     start_time = time.time()
     global model, last_training_time
 
     # 1) Parse internal discharges
     internal: List[InternalDischarge] = []
-    for d in request.discharges:
+    for d in discharges:
         signals = [InternalSignal(
-            label=s.fileName,
-            times=s.times or d.times,
+            label=s.filename,
+            times=d.times,
             values=s.values,
             signal_type=get_signal_type(get_sensor_id(s)),
             disruption_class=(DisruptionClass.Anomaly if d.anomalyTime else DisruptionClass.Normal)
@@ -342,16 +361,46 @@ async def train_model(request: TrainingRequest):
                              metrics=TrainingMetrics(accuracy=None,loss=None,f1Score=None),
                              executionTimeMs=elapsed)
 
+
+# ---------------------------------------------------------------------------
+# Outlier protocol training endpoints
+# ---------------------------------------------------------------------------
+
+@app.post('/train', response_model=StartTrainingResponse)
+async def start_training(request: StartTrainingRequest):
+    global training_session
+    if training_session is not None:
+        raise HTTPException(status_code=503, detail='Training already in progress')
+    training_session = {
+        'total': request.totalDischarges,
+        'discharges': [],
+    }
+    return StartTrainingResponse(expectedDischarges=request.totalDischarges)
+
+
+@app.post('/train/{ordinal}', response_model=DischargeAck)
+async def push_discharge(ordinal: int, discharge: Discharge):
+    global training_session
+    if training_session is None:
+        raise HTTPException(status_code=400, detail='No active training session')
+    if ordinal != len(training_session['discharges']) + 1:
+        raise HTTPException(status_code=400, detail='Unexpected ordinal')
+    training_session['discharges'].append(discharge)
+    total = training_session['total']
+    if ordinal == total:
+        # run training synchronously
+        train_model(training_session['discharges'])
+        training_session = None
+    return DischargeAck(ordinal=ordinal, totalDischarges=total)
+
 @app.post('/predict', response_model=PredictionResponse)
-async def predict(request: PredictionRequest):
+async def predict(discharge: Discharge):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not available")
     
     start_time = time.time()
-    for disc in request.discharges:
-        data = np.stack([s.values for s in disc.signals])  # (n_sensors, T)
-    
-    discharges_int = to_internal_discharges(request.discharges)
+    data = np.stack([s.values for s in discharge.signals])  # (n_sensors, T)
+    discharges_int = to_internal_discharges([discharge])
     with open('zscore_stats.json', 'r') as f:
         stats = {SignalType[k]: v for k, v in json.load(f).items()}
 
@@ -382,13 +431,13 @@ async def predict(request: PredictionRequest):
         raise HTTPException(status_code=400, detail='No valid windows generated for prediction')
 
     overall_confidence = float(np.mean(mean_probs))
-    prediction = int(overall_confidence > 0.5)
+    pred_label = "Anomaly" if overall_confidence > 0.5 else "Normal"
     exec_ms = int((time.time() - start_time) * 1000)
     mean_probs = np.array(mean_probs)
 
     return PredictionResponse(
-        prediction=prediction,
-        confidence=overall_confidence if prediction == 1 else 1 - overall_confidence,
+        prediction=pred_label,
+        confidence=overall_confidence if pred_label == "Anomaly" else 1 - overall_confidence,
         executionTimeMs=exec_ms,
         model="fft_cnn",
         details={
@@ -403,15 +452,16 @@ async def health_check():
     mem = psutil.virtual_memory()
     
     return HealthCheckResponse(
+        name="fft_cnn",
+        uptime=time.time() - start_time,
+        lastTraining=last_training_time,
         status="online" if model is not None else "degraded",
         version="1.0.0",
-        uptime=time.time() - start_time,
         memory=MemoryInfo(
             total=mem.total / (1024*1024),  # Convert to MB
             used=mem.used / (1024*1024)
         ),
         load=psutil.cpu_percent() / 100,
-        lastTraining=last_training_time
     )
 
 # Custom middleware to handle large request JSON payloads
