@@ -7,6 +7,7 @@ import re
 from collections import Counter
 
 from fastapi import HTTPException, Request, FastAPI
+import asyncio
 from scipy.fft import rfft
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import classification_report
@@ -44,6 +45,7 @@ MODEL_PATH  = "cnn_fft_model.keras"
 start_time = time.time()
 last_training_time = None
 model = None
+training_session = {"total": 0, "timeout": 0, "discharges": []}
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -51,10 +53,13 @@ logger = logging.getLogger(__name__)
 
 # Define Pydantic models for request/response based on API schemas
 class Signal(BaseModel):
-    fileName: str
+    filename: str = Field(..., alias="fileName")
     values: List[float]
     times: Optional[List[float]] = None
     length: Optional[int] = None
+
+    class Config:
+        allow_population_by_field_name = True
 
 class Discharge(BaseModel):
     id: str
@@ -64,7 +69,7 @@ class Discharge(BaseModel):
     signals: List[Signal]
 
 class PredictionRequest(BaseModel):
-    discharges: List[Discharge]
+    discharge: Discharge
 
 class PredictionResponse(BaseModel):
     prediction: int
@@ -94,17 +99,29 @@ class TrainingResponse(BaseModel):
     metrics: Optional[TrainingMetrics] = None
     executionTimeMs: float
 
+class StartTrainingRequest(BaseModel):
+    totalDischarges: int
+    timeoutSeconds: int
+
+class StartTrainingResponse(BaseModel):
+    expectedDischarges: int
+
+class DischargeAck(BaseModel):
+    ordinal: int
+    totalDischarges: int
+
 class MemoryInfo(BaseModel):
     total: float
     used: float
 
 class HealthCheckResponse(BaseModel):
-    status: str
-    version: str
+    name: str
     uptime: float
-    memory: MemoryInfo
-    load: float
     lastTraining: Optional[str] = None
+    status: Optional[str] = None
+    version: Optional[str] = None
+    memory: Optional[MemoryInfo] = None
+    load: Optional[float] = None
 
 class ErrorResponse(BaseModel):
     error: str
@@ -127,7 +144,7 @@ def to_internal_discharges(discharges_pyd: List[Discharge]) -> List[InternalDisc
             sig_type = get_signal_type(get_sensor_id(s))
             signals_int.append(
                 InternalSignal(
-                    label=s.fileName,
+                    label=s.filename,
                     times=s.times or d.times,
                     values=s.values,
                     signal_type=sig_type,
@@ -151,11 +168,11 @@ if os.path.exists(MODEL_PATH):
 
 def get_sensor_id(signal: Signal) -> str:
     """Extract sensor ID from signal file name"""
-    match = re.match(PATTERN, signal.fileName)
+    match = re.match(PATTERN, signal.filename)
     if match:
         return match.group(2)
     else:
-        raise ValueError(f"Invalid signal file name format: {signal.fileName}")
+        raise ValueError(f"Invalid signal file name format: {signal.filename}")
 
 def window_fft(signal: np.ndarray) -> np.ndarray:
     """
@@ -194,16 +211,15 @@ def is_anomaly(discharge: Discharge) -> bool:
     """Determine if a discharge has an anomaly based on anomalyTime"""
     return discharge.anomalyTime is not None
 
-@app.post('/train', response_model=TrainingResponse)
-async def train_model(request: TrainingRequest):
+def run_training(discharges: List[Discharge]) -> TrainingResponse:
     start_time = time.time()
     global model, last_training_time
 
     # 1) Parse internal discharges
     internal: List[InternalDischarge] = []
-    for d in request.discharges:
+    for d in discharges:
         signals = [InternalSignal(
-            label=s.fileName,
+            label=s.filename,
             times=s.times or d.times,
             values=s.values,
             signal_type=get_signal_type(get_sensor_id(s)),
@@ -342,16 +358,46 @@ async def train_model(request: TrainingRequest):
                              metrics=TrainingMetrics(accuracy=None,loss=None,f1Score=None),
                              executionTimeMs=elapsed)
 
+
+async def async_run_training(discharges: List[Discharge]):
+    await asyncio.to_thread(run_training, discharges)
+
+
+@app.post('/train', response_model=StartTrainingResponse)
+async def start_training(request: StartTrainingRequest):
+    if training_session['total']:
+        raise HTTPException(status_code=503, detail='Training already in progress')
+    training_session['total'] = request.totalDischarges
+    training_session['timeout'] = request.timeoutSeconds
+    training_session['discharges'] = []
+    return StartTrainingResponse(expectedDischarges=request.totalDischarges)
+
+
+@app.post('/train/{ordinal}', response_model=DischargeAck)
+async def push_discharge(ordinal: int, discharge: Discharge):
+    if training_session['total'] == 0:
+        raise HTTPException(status_code=400, detail='No active training session')
+    expected_next = len(training_session['discharges']) + 1
+    if ordinal != expected_next or ordinal > training_session['total']:
+        raise HTTPException(status_code=400, detail='Unexpected ordinal')
+    training_session['discharges'].append(discharge)
+    total = training_session['total']
+    ack = DischargeAck(ordinal=ordinal, totalDischarges=total)
+    if ordinal == total:
+        stored = training_session['discharges'].copy()
+        training_session['total'] = 0
+        training_session['discharges'] = []
+        training_session['timeout'] = 0
+        asyncio.create_task(async_run_training(stored))
+    return ack
+
 @app.post('/predict', response_model=PredictionResponse)
-async def predict(request: PredictionRequest):
+async def predict(request: Discharge):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not available")
     
     start_time = time.time()
-    for disc in request.discharges:
-        data = np.stack([s.values for s in disc.signals])  # (n_sensors, T)
-    
-    discharges_int = to_internal_discharges(request.discharges)
+    discharges_int = to_internal_discharges([request])
     with open('zscore_stats.json', 'r') as f:
         stats = {SignalType[k]: v for k, v in json.load(f).items()}
 
@@ -401,8 +447,9 @@ async def predict(request: PredictionRequest):
 async def health_check():
     # Get memory information
     mem = psutil.virtual_memory()
-    
+
     return HealthCheckResponse(
+        name="fft_cnn",
         status="online" if model is not None else "degraded",
         version="1.0.0",
         uptime=time.time() - start_time,
