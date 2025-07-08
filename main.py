@@ -20,7 +20,7 @@ from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 import uvicorn
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, Field, validator
 import time
 import datetime
 import os
@@ -72,13 +72,18 @@ class Discharge(BaseModel):
         return v
 
 
+class WindowProperties(BaseModel):
+    featureValues: List[float] = Field(..., min_items=1)
+    prediction: str = Field(..., pattern=r'^(Anomaly|Normal)$')
+    justification: float
 
 class PredictionResponse(BaseModel):
     prediction: str
     confidence: float
     executionTimeMs: float
     model: str
-    details: Optional[Dict[str, Any]] = None
+    windowSize: int = 48
+    windows: List[WindowProperties]
 
 class TrainingOptions(BaseModel):
     epochs: Optional[int] = None
@@ -408,7 +413,7 @@ async def predict(discharge: Discharge):
         discharges_int = apply_zscore(discharges_int, stats)
     
     
-    mean_probs = []
+    mean_probs, window_probs = [], []
     stride = int(WINDOW_SIZE * (1 - OVERLAP))
     for disc in discharges_int:
         data = np.stack([s.values for s in disc.signals])  # shape (n_sensors, T)
@@ -424,7 +429,10 @@ async def predict(discharge: Discharge):
         E_batch = np.asarray(energies).reshape(-1, 1)
         probs = model.predict([X_batch, E_batch])[:, 0]
         mean_probs.append(probs.mean())
+        window_probs.extend(probs)
     
+    justification = [float(prob) for prob in window_probs]
+    print(f"Justifification: {justification}")
 
     if not mean_probs:
         print("No valid windows generated for prediction")
@@ -434,15 +442,20 @@ async def predict(discharge: Discharge):
     pred_label = "Anomaly" if overall_confidence > 0.5 else "Normal"
     exec_ms = int((time.time() - start_time) * 1000)
     mean_probs = np.array(mean_probs)
-
+    
     return PredictionResponse(
         prediction=pred_label,
         confidence=overall_confidence if pred_label == "Anomaly" else 1 - overall_confidence,
         executionTimeMs=exec_ms,
         model="fft_cnn",
-        details={
-            "individualPredictions": mean_probs.tolist()
-        }
+        windowSize=WINDOW_SIZE,
+        windows=[
+            WindowProperties(
+                featureValues= list(win.flatten()),
+                prediction="Anomaly" if prob > 0.5 else "Normal",
+                justification=float(prob)
+            ) for win, prob in zip(windows, window_probs)
+        ]
     )
 
 
@@ -485,6 +498,5 @@ if __name__ == "__main__":
 
     uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=False, 
                 limit_concurrency=50, 
-                limit_max_requests=20000,
                 timeout_keep_alive=120)
 
