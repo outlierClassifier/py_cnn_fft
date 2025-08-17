@@ -8,7 +8,7 @@ from collections import Counter
 
 from fastapi import HTTPException, Request, FastAPI
 from scipy.fft import rfft
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold, GroupKFold
 from sklearn.metrics import classification_report
 from sklearn.utils.class_weight import compute_class_weight
 
@@ -36,11 +36,11 @@ random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 PATTERN = "DES_(\\d+)_(\\d+)"
-WINDOW_SIZE = 256
+WINDOW_SIZE = 16
 FREQ_BINS   = WINDOW_SIZE // 2 + 1
-OVERLAP     = 0.5
+OVERLAP     = 0
 SAMPLE_PER_DISCHARGE = 120
-MODEL_PATH  = "cnn_fft_model.keras"
+MODEL_PATH  = "cnn_fft_model copy.keras"
 start_time = time.time()
 last_training_time = None
 model = None
@@ -82,7 +82,7 @@ class PredictionResponse(BaseModel):
     confidence: float
     executionTimeMs: float
     model: str
-    windowSize: int = 48
+    windowSize: int = WINDOW_SIZE
     windows: List[WindowProperties]
 
 class TrainingOptions(BaseModel):
@@ -188,10 +188,91 @@ def window_fft(signal: np.ndarray) -> np.ndarray:
     """
     eps = 1e-9
     spec = np.abs(rfft(signal, axis=0))  # (FREQ_BINS, sensores)
-    spec = np.log(spec + eps)
+    spec = np.log(spec + eps).astype(np.float32)
     return spec[..., np.newaxis]
 
-def build_fft_cnn_model(n_sensors: int) -> Model:
+def window_label_and_weight(
+    times,
+    anomaly_time: float | None,
+    end_idx: int,
+    dt_s: float,
+    H_pre: float = 0.5,
+    H_post: float = 0.5,
+    post_plateau_windows: int = 2,
+    post_tail_floor: float = 0.3
+) -> tuple[int, float]:
+    if anomaly_time is None:
+        return 0, 1.0  # non disruptive discharge
+
+    t_end = times[end_idx]
+    dt = anomaly_time - t_end   # >0: pre-event, <0: post-event
+
+    # Far before the event
+    if dt >= H_pre:
+        return 0, 1.0
+
+    # Pre-event with linear ramp of weights
+    if 0.0 <= dt < H_pre:
+        w = 1.0 - (dt / H_pre)     # 0 in -H_pre, 1 in 0
+        return 1, w
+
+    # Post-event
+    # Duration of the plateau after the event
+    plateau_s = max(0, post_plateau_windows) * dt_s * WINDOW_SIZE
+    dt_post = -dt  # seconds elapsed since the event
+
+    if dt_post <= plateau_s:
+        # Immediately after: as important as the event
+        return 1, 1.0
+
+    if dt_post <= H_post:
+        # Tail with constant weight (non-zero)
+        return 1, max(0.0, float(post_tail_floor))
+
+    # Beyond the POST horizon: if you want it to NEVER decay, we keep the floor
+    return 1, max(0.0, float(post_tail_floor))
+
+A_MINOR = 0.95  # [m] radio menor de JET (usa tu valor de referencia y documenta)
+
+def _safe_div(a, b):
+    return 0.0 if b == 0 or not np.isfinite(a) or not np.isfinite(b) else (a / b)
+
+def inter_signal_features(win_raw: np.ndarray, prev_logs: tuple[float,float] | None):
+    mean_vals = np.mean(win_raw, axis=1)  # (7,)
+    Ip, LM, LI, NE, dWdt, Prad, Pin = mean_vals
+
+    Ip_MA  = Ip * 1e-6
+    ne_1e20 = NE * 1e-20
+
+    rad_frac  = _safe_div(Prad, Pin)
+    greenwald = _safe_div(ne_1e20, _safe_div(Ip_MA, (np.pi * A_MINOR**2)))
+    LM_norm   = _safe_div(abs(LM), max(Ip_MA, 1e-12))
+    li_norm   = _safe_div(LI, max(Ip_MA, 1e-12))
+    beta_loss = _safe_div(abs(dWdt), max(Pin, 1e-12))
+    cross_std = float(np.std(mean_vals))
+    logE      = float(np.log1p(np.mean(win_raw.astype(np.float64) ** 2)))
+
+    L_rad   = np.log1p(max(0.0, rad_frac))
+    L_gw    = np.log1p(max(0.0, greenwald))
+    L_lm    = np.log1p(LM_norm)
+    L_li    = np.log1p(abs(li_norm))
+    L_beta  = np.log1p(beta_loss)
+
+    # DELTAS (diferencia en el espacio log-comprimido)
+    if prev_logs is None:
+        d_rad, d_beta = 0.0, 0.0
+    else:
+        prev_Lrad, prev_Lbeta = prev_logs
+        d_rad  = L_rad  - prev_Lrad
+        d_beta = L_beta - prev_Lbeta
+
+    feat = np.array([L_rad, L_gw, L_lm, L_li, L_beta, cross_std, logE, d_rad, d_beta],
+                    dtype=np.float32)
+
+    return feat, (L_rad, L_beta)
+
+
+def build_fft_cnn_model(n_sensors: int, n_aux: int = 1) -> Model:
     # Spectral branch
     inp_spec = Input(shape=(FREQ_BINS, n_sensors, 1), name="spectral_input")
     x = Conv2D(32, (3, 3), padding="same")(inp_spec)
@@ -203,7 +284,7 @@ def build_fft_cnn_model(n_sensors: int) -> Model:
     x = GlobalAveragePooling2D()(x)
 
     # Energy branch
-    inp_e = Input(shape=(1,), name="energy_input")
+    inp_e = Input(shape=(n_aux,), name="energy_input")
     e = Dense(32, activation="relu")(inp_e)
     e = Dense(16, activation="relu", name="dense_energy")(e)
 
@@ -225,6 +306,9 @@ def train_model(discharges: List[Discharge]) -> TrainingResponse:
 
     # 1) Parse internal discharges
     internal: List[InternalDischarge] = []
+    raw_arrays = [np.stack([s.values for s in d.signals]) for d in discharges]
+    times_list = [np.array(d.times) for d in discharges]
+    anom_times = [d.anomalyTime for d in discharges]
     for d in discharges:
         signals = [InternalSignal(
             label=s.filename,
@@ -263,100 +347,126 @@ def train_model(discharges: List[Discharge]) -> TrainingResponse:
         internal += aug
 
     # 3) Manual sliding windows + FFT
-    X, E, y, groups = [], [], [], []
+    X, AUX, y, W, groups = [], [], [], [], []
     stride = int(WINDOW_SIZE * (1 - OVERLAP))
+
     for disc_id, disc in enumerate(internal):
-        # Montar matriz sensores x tiempo
-        data = np.stack([s.values for s in disc.signals])  # shape (n_sensors, T)
-        T = data.shape[1]
-        # Generar ventanas
+        data_norm = np.stack([s.values for s in disc.signals])
+        data_raw  = raw_arrays[disc_id]
+        times     = times_list[disc_id]
+        anom_t    = anom_times[disc_id]
+        dt_s      = float(np.median(np.diff(times))) if len(times) > 1 else 0.001
+
+        T = data_norm.shape[1]
         idxs = list(range(0, T - WINDOW_SIZE + 1, stride))
-        if len(idxs) > SAMPLE_PER_DISCHARGE:
-            idxs = np.linspace(0, len(idxs)-1, SAMPLE_PER_DISCHARGE, dtype=int).tolist()
-            idxs = [idxs[i] * stride for i in range(len(idxs))]
+        # (aquí entra el recorte prioritario por peso del apartado 1)
+
+        prev_logs = None
         for start in idxs:
-            window = data[:, start:start+WINDOW_SIZE].T  # (WINDOW_SIZE, n_sensors)
-            fft_spec = window_fft(window)
-            E_win = np.mean(window ** 2).astype(np.float32)
+            end = start + WINDOW_SIZE
+            win_norm = data_norm[:, start:end].T
+            win_raw  = data_raw[:,  start:end]
+
+            fft_spec = window_fft(win_norm)
+            aux_vec, prev_logs = inter_signal_features(win_raw, prev_logs)
+
+            end_idx = min(end - 1, len(times) - 1)
+            yi, wi  = window_label_and_weight(times, anom_t, end_idx, dt_s)
+
             X.append(fft_spec)
-            E.append(E_win)
-            y.append(1 if disc.disruption_class == DisruptionClass.Anomaly else 0)
+            AUX.append(aux_vec)
+            y.append(yi)
+            W.append(wi)
             groups.append(disc_id)
 
-    # etiquetas a nivel de descarga
+
     y_disc = [1 if d.disruption_class == DisruptionClass.Anomaly else 0 for d in internal]
     y_disc = np.array(y_disc)
-    groups_disc = np.arange(len(internal))
 
-    X = np.stack(X)
-    E = np.asarray(E).reshape(-1, 1)
-    y = np.array(y)
+    X   = np.stack(X).astype(np.float32)
+    AUX = np.stack(AUX).astype(np.float32)
+    y   = np.array(y, dtype=int)
+    W   = np.array(W, dtype=float)
     groups = np.array(groups)
 
-    max_trials = 250
-    n_splits = min(4, np.bincount(y_disc).min())
-    balanced_splits = None
+    aux_mean = np.nanmean(AUX, axis=0)
+    aux_std  = np.nanstd(AUX,  axis=0) + 1e-6
+    AUX_norm = ((AUX - aux_mean) / aux_std).astype(np.float32)
 
-    for trial in range(max_trials):
-        splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=SEED + trial)
-        candidate = [] # store tr, val for this trial
+    with open('aux_stats.json', 'w') as f:
+        json.dump({'mean': aux_mean.tolist(), 'std': aux_std.tolist()}, f)
 
-        for (tr, val) in splitter.split(groups_disc, y_disc, groups_disc):
-            cnt = Counter(y_disc[val])
-            ratio = min(cnt.values()) / max(cnt.values())
 
-            if len(cnt) == 1:
-                break
+    gkf = GroupKFold(n_splits=2)
+    folds = []
+    neg_probs_all, pos_probs_all = [], []
+    neg_max_by_shot, pos_max_by_shot = [], []
+    n_aux = AUX_norm.shape[1]
 
-            if ratio < 0.25:
-                break
-            candidate.append((tr, val))
-        else:
-            # If we reach here, it means we found a balanced split
-            balanced_splits = candidate
-            break
-    
-    if balanced_splits is None:
-        raise RuntimeError(
-            f"Unable to find a balanced split after {max_trials} trials. "
-            "Consider reducing the number of splits or adjusting the distribution of discharges."
-        )
-
-    for fold, (tr, val) in enumerate(balanced_splits, start=1):
-        tr_mask = np.isin(groups, tr)
+    for tr_idx, val_idx in gkf.split(X, y, groups):
+        tr_mask = np.zeros(len(y), dtype=bool); tr_mask[tr_idx] = True
         val_mask = ~tr_mask
+        folds.append((tr_mask, val_mask))
 
-        X_tr, E_tr, y_tr = X[tr_mask], E[tr_mask], y[tr_mask]
-        X_val, E_val, y_val = X[val_mask], E[val_mask], y[val_mask]
+    for fold, (tr_mask, val_mask) in enumerate(folds, start=1):
+        X_tr, A_tr, y_tr, W_tr = X[tr_mask], AUX_norm[tr_mask], y[tr_mask], W[tr_mask]
+        X_val, A_val, y_val    = X[val_mask], AUX_norm[val_mask], y[val_mask]
 
         cnt = Counter(y_val)
         print(f'--- Fold: {fold} support: {cnt} ---')
 
-        model = build_fft_cnn_model(n_sensors=X.shape[2])
+        cw = compute_class_weight(class_weight='balanced', classes=np.array([0,1]), y=y_tr)
+        cdict = {0: float(cw[0]), 1: float(cw[1])}
+        sw_tr = np.asarray([cdict[yi] * wi for yi, wi in zip(y_tr, W_tr)], dtype=np.float32)
+        med = np.median(sw_tr) if np.isfinite(sw_tr).any() else 1.0
+        sw_tr = sw_tr / (med + 1e-8)
+        sw_tr = np.clip(sw_tr, 1e-3, 100.0)
+
+        model = build_fft_cnn_model(n_sensors=X.shape[2], n_aux=n_aux)
+
         callbacks = [EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True),
                      ReduceLROnPlateau(monitor='val_loss', patience=2, factor=0.5)]
-        class_weights = compute_class_weight('balanced', classes=np.unique(y_tr), y=y_tr)
-        class_weights = {i: w for i, w in enumerate(class_weights)}
-        model.fit([X_tr, E_tr], y_tr, 
-                  validation_data=([X_val, E_val], y_val), 
+
+        model.fit([X_tr, A_tr], y_tr, 
+                  validation_data=([X_val, A_val], y_val), 
                   epochs=40, 
                   batch_size=16,
-                  class_weight=class_weights, 
-                  callbacks=callbacks, 
+                  sample_weight=sw_tr,
+                  callbacks=callbacks,
                   verbose=2)
 
         w_E, b_E = model.get_layer('dense_energy').get_weights()
         print(f"||W_E||: {np.linalg.norm(w_E)}")
         print(f"||b_E||: {np.linalg.norm(b_E)}")
 
-        preds = (model.predict([X_val, E_val])[:,0] > 0.5).astype(int)
-        print(classification_report(y_val, 
-                                    preds,
-                                    labels=[0, 1],
-                                    target_names=['Normal','Anomaly'], 
-                                    zero_division=0))
+        val_probs = model.predict([X_val, A_val], verbose=0)[:, 0]
 
-    # Guardar modelo
+        preds = (val_probs > 0.5).astype(int)
+        print(classification_report(y_val, preds, labels=[0,1],
+            target_names=['Normal','Anomaly'], zero_division=0))
+
+        g_val = groups[val_mask]
+        shots = np.unique(g_val)
+        for sh in shots:
+            m = (g_val == sh)
+            max_p = float(np.max(val_probs[m]))
+            y_sh = int(np.max(y_val[m]))
+            if y_sh == 0:
+                neg_max_by_shot.append(max_p)
+            else:
+                pos_max_by_shot.append(max_p)
+
+    if len(neg_max_by_shot) > 0:
+        q = 0.99
+        tau = float(np.quantile(np.array(neg_max_by_shot), q))
+        with open('threshold.json', 'w') as f:
+            json.dump({'tau': tau, 'quantile': q, 'neg_shots': len(neg_max_by_shot)}, f)
+        print(f'[CALIB] TAU (per-shot) = p{int(q*100)} of negatives: {tau:.4f} '
+            f'(neg shots={len(neg_max_by_shot)})')
+    else:
+        print('[CALIB] No negative shots in validation; TAU not updated.')
+
+
     model.save(MODEL_PATH)
     last_training_time = datetime.datetime.now().isoformat()
     
@@ -402,61 +512,73 @@ async def push_discharge(ordinal: int, discharge: Discharge):
 async def predict(discharge: Discharge):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not available")
-    
+
     start_time = time.time()
-    data = np.stack([s.values for s in discharge.signals])  # (n_sensors, T)
+
     discharges_int = to_internal_discharges([discharge])
     with open('zscore_stats.json', 'r') as f:
         stats = {SignalType[k]: v for k, v in json.load(f).items()}
-
     if not are_normalized(discharges_int):
         discharges_int = apply_zscore(discharges_int, stats)
-    
-    
-    mean_probs, window_probs = [], []
+
+    try:
+        with open('aux_stats.json', 'r') as f:
+            aux_stats = json.load(f)
+        aux_mean = np.array(aux_stats['mean'], dtype=np.float32)
+        aux_std  = np.array(aux_stats['std'],  dtype=np.float32)
+    except Exception:
+        aux_mean = aux_std = None
+
+    data_norm = np.stack([s.values for s in discharges_int[0].signals])  # (n_sensors, T)
+
+    data_raw = np.stack([s.values for s in discharge.signals])           # (n_sensors, T)
+
+    window_probs, all_windows = [], []
     stride = int(WINDOW_SIZE * (1 - OVERLAP))
-    for disc in discharges_int:
-        data = np.stack([s.values for s in disc.signals])  # shape (n_sensors, T)
-        windows, energies = [], []
-        for start in range(0, data.shape[1] - WINDOW_SIZE + 1, stride):
-            win = data[:, start:start+WINDOW_SIZE].T
-            windows.append(window_fft(win))
-            energies.append(np.mean(win ** 2).astype(np.float32))
 
-        if not windows:
-            continue
-        X_batch = np.stack(windows)
-        E_batch = np.asarray(energies).reshape(-1, 1)
-        probs = model.predict([X_batch, E_batch])[:, 0]
-        mean_probs.append(probs.mean())
-        window_probs.extend(probs)
-    
-    justification = [float(prob) for prob in window_probs]
-    print(f"Justifification: {justification}")
+    prev_logs = None
+    for start in range(0, data_norm.shape[1] - WINDOW_SIZE + 1, stride):
+        win_norm = data_norm[:, start:start+WINDOW_SIZE].T
+        win_raw  = data_raw[:,  start:start+WINDOW_SIZE]
 
-    if not mean_probs:
-        print("No valid windows generated for prediction")
+        X_batch = np.expand_dims(window_fft(win_norm), axis=0)
+        aux_vec, prev_logs = inter_signal_features(win_raw, prev_logs)
+        aux_vec = aux_vec[np.newaxis, :].astype(np.float32)
+        if aux_mean is not None:
+            aux_vec = ((aux_vec - aux_mean) / aux_std).astype(np.float32)
+
+        prob = float(model.predict([X_batch, aux_vec], verbose=0)[0, 0])
+        window_probs.append(prob); all_windows.append(X_batch[0])
+
+    if not window_probs:
         raise HTTPException(status_code=400, detail='No valid windows generated for prediction')
 
-    overall_confidence = float(np.mean(mean_probs))
-    pred_label = "Anomaly" if overall_confidence > 0.5 else "Normal"
-    exec_ms = int((time.time() - start_time) * 1000)
-    mean_probs = np.array(mean_probs)
-    
+    max_prob = float(np.max(window_probs))
+    TAU = 0.5
+    try:
+        with open('threshold.json', 'r') as f:
+            TAU = float(json.load(f).get('tau', 0.5))
+    except Exception:
+        pass
+
+    pred_label = "Anomaly" if max_prob >= TAU else "Normal"
+    overall_confidence = max_prob if pred_label == "Anomaly" else 1.0 - max_prob
+
     return PredictionResponse(
         prediction=pred_label,
-        confidence=overall_confidence if pred_label == "Anomaly" else 1 - overall_confidence,
-        executionTimeMs=exec_ms,
+        confidence=overall_confidence,
+        executionTimeMs=int((time.time() - start_time) * 1000),
         model="fft_cnn",
         windowSize=WINDOW_SIZE,
         windows=[
             WindowProperties(
-                featureValues= list(win.flatten()),
-                prediction="Anomaly" if prob > 0.5 else "Normal",
+                featureValues=list(win.flatten()),
+                prediction=("Anomaly" if prob >= TAU else "Normal"),
                 justification=float(prob)
-            ) for win, prob in zip(windows, window_probs)
+            ) for win, prob in zip(all_windows, window_probs)
         ]
     )
+
 
 
 @app.get("/health", response_model=HealthCheckResponse)
@@ -496,7 +618,5 @@ if __name__ == "__main__":
             logger.error(f"Error loading model: {str(e)}")
             model = None
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=False, 
-                limit_concurrency=50, 
-                timeout_keep_alive=120)
+    uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=False)
 
